@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ARENA QUADRADOS</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
 <style>
   :root{
     --bg:#0b0d14;
@@ -58,6 +59,32 @@
     text-align:center;
   }
   #nameInput:focus{border-color:var(--accent);}
+  #roomInput{
+    background:var(--panel);
+    border:2px solid var(--panel-border);
+    color:var(--accent2);
+    padding:10px 16px;
+    font-family:inherit;
+    font-size:15px;
+    letter-spacing:3px;
+    width:260px;
+    outline:none;
+    text-align:center;
+    text-transform:uppercase;
+  }
+  #roomInput::placeholder{color:var(--muted);letter-spacing:1px;text-transform:none;font-size:11px;}
+  #roomInput:focus{border-color:var(--accent2);}
+  #connStatus{
+    min-height:16px;font-size:11px;letter-spacing:1px;color:var(--muted);text-align:center;
+  }
+  #connStatus.err{color:var(--danger);}
+  #connStatus.ok{color:#4dff88;}
+  #roomBanner{
+    display:none;
+    background:rgba(0,229,255,0.08);border:1px solid var(--accent2);
+    color:var(--accent2);padding:8px 16px;font-size:12px;letter-spacing:2px;
+    text-align:center;
+  }
   #joinBtn{
     background:var(--accent);
     color:#1a1200;
@@ -285,6 +312,7 @@
     <h1>ARENA QUADRADOS</h1>
     <div class="sub">MULTIPLAYER · TOP-DOWN · SHOOTER</div>
     <input id="nameInput" maxlength="12" placeholder="SEU NOME"/>
+    <input id="roomInput" maxlength="8" placeholder="CÓDIGO DA SALA (vazio = criar nova sala)"/>
     <div class="colorPick" id="colorPick"></div>
     <div class="botPick" id="botPick">
       <button class="botBtn selected" data-n="0">SEM BOTS</button>
@@ -294,9 +322,11 @@
     </div>
     <button id="devToggle" class="botBtn devBtn">👑 SOU O DEV — ATIVAR TAG</button>
     <button id="joinBtn">ENTRAR NA ARENA</button>
+    <div id="connStatus"></div>
     <div class="controlsBox">
       <div><b>WASD</b> mover · <b>MOUSE</b> mirar · <b>CLIQUE</b> atirar</div>
       <div><b>1</b> Metralhadora &nbsp; <b>2</b> Shotgun &nbsp; <b>3</b> Sniper (instakill)</div>
+      <div>Deixe o código vazio pra criar uma sala nova e chamar seus amigos. Bots só valem pra quem cria a sala.</div>
     </div>
   </div>
 
@@ -420,7 +450,7 @@
   ];
 
   // ---------------- STATE ----------------
-  let myId = "p_" + Math.random().toString(36).slice(2,10);
+  let myId = null;
   let myName = "";
   let myColor = COLORS[0];
   let players = {}; // id -> state object (cache)
@@ -441,6 +471,13 @@
   let deathTime = 0;
   let killFeedEl, scoreListEl, hpBarInner, hpLabel, playerCountEl;
   let canvas, ctx;
+
+  // ---------------- NETWORK (WebRTC via PeerJS — works anywhere, not just inside Claude) ----------------
+  let peer = null;
+  let isHost = false;
+  let roomCode = "";
+  let hostConn = null;      // used by a joining client: connection to the host
+  let peerConns = {};       // used by the host: map of peerId -> connection
 
   function rnd(a,b){return a + Math.random()*(b-a);}
 
@@ -493,97 +530,166 @@
     };
   }
 
-  // ---------------- STORAGE SYNC ----------------
-  async function pushMyState(){
+  // ---------------- NETWORK SYNC ----------------
+  function generateRoomCode(){
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let s = '';
+    for(let i=0;i<5;i++) s += chars[Math.floor(Math.random()*chars.length)];
+    return s;
+  }
+
+  function connectAsHost(code){
+    return new Promise((resolve, reject)=>{
+      peer = new Peer(code);
+      peer.on('open', id=>{
+        isHost = true;
+        roomCode = id;
+        myId = id;
+        resolve(id);
+      });
+      peer.on('connection', conn=>{
+        peerConns[conn.peer] = conn;
+        conn.on('data', msg=> handleHostMessage(conn.peer, msg));
+        conn.on('close', ()=>{
+          delete peerConns[conn.peer];
+          delete players[conn.peer];
+        });
+      });
+      peer.on('error', err=> reject(err));
+    });
+  }
+
+  function connectAsClient(code){
+    return new Promise((resolve, reject)=>{
+      peer = new Peer();
+      peer.on('open', id=>{
+        myId = id;
+        const conn = peer.connect(code, {reliable:true});
+        hostConn = conn;
+        conn.on('open', ()=>{
+          isHost = false;
+          roomCode = code;
+          resolve(id);
+        });
+        conn.on('data', msg=> handleClientMessage(msg));
+        conn.on('close', ()=>{
+          document.getElementById('connBadge').innerHTML = '<span class="dot" style="background:#ff3b5c;"></span>⚠️ conexão com o anfitrião perdida';
+        });
+      });
+      peer.on('error', err=> reject(err));
+    });
+  }
+
+  function sendToHost(msg){
+    if(hostConn && hostConn.open){
+      try{ hostConn.send(msg); }catch(e){}
+    }
+  }
+
+  function broadcastSnapshot(){
+    if(!isHost) return;
+    const snapshot = { type:'snapshot', players };
+    for(const id in peerConns){
+      const conn = peerConns[id];
+      if(conn && conn.open){
+        try{ conn.send(snapshot); }catch(e){}
+      }
+    }
+  }
+
+  function handleHostMessage(fromId, msg){
+    if(msg.type === 'state'){
+      players[fromId] = msg.player;
+    } else if(msg.type === 'damage'){
+      applyDamageHostSide(msg.targetId, msg.dmg, msg.instakill, msg.weaponName, msg.shooterId);
+    }
+  }
+
+  function handleClientMessage(msg){
+    if(msg.type !== 'snapshot') return;
+    const incoming = msg.players;
+    for(const id in incoming){
+      if(id === myId){
+        // trust the host for authoritative fields, keep our own predicted position smooth
+        const me = players[myId];
+        const auth = incoming[myId];
+        if(me && auth){
+          me.hp = auth.hp; me.alive = auth.alive;
+          me.kills = auth.kills; me.deaths = auth.deaths;
+          me.deathTime = auth.deathTime;
+        }
+        continue;
+      }
+      players[id] = incoming[id];
+    }
+    // drop anyone no longer present in the host's snapshot (disconnected)
+    for(const id in players){
+      if(id === myId) continue;
+      if(!(id in incoming)) delete players[id];
+    }
+  }
+
+  function applyDamageHostSide(targetId, dmg, instakill, weaponName, shooterId){
+    const shooterName = players[shooterId] ? players[shooterId].name : 'Bot';
+    const target = players[targetId];
+    if(!target || !target.alive) return;
+    if(target.invincibleUntil && Date.now() < target.invincibleUntil) return;
+    if(targetId === myId && godMode) return;
+    target.hp -= instakill ? 9999 : dmg;
+    if(target.hp <= 0){
+      target.hp = 0;
+      target.alive = false;
+      target.deaths = (target.deaths||0)+1;
+      target.deathTime = Date.now();
+      if(players[shooterId]) players[shooterId].kills = (players[shooterId].kills||0)+1;
+      addKillFeed(shooterName, target.name, weaponName, instakill);
+    }
+  }
+
+  function pushMyState(){
     const p = players[myId];
     if(!p) return;
     p.ts = Date.now();
-    try{
-      await window.storage.set('player:'+myId, JSON.stringify(p), true);
-    }catch(e){ /* ignore transient errors */ }
+    if(!isHost) sendToHost({ type:'state', player:p });
   }
 
-  async function pollPlayers(){
-    try{
-      const list = await window.storage.list('player:', true);
-      if(!list || !list.keys) return;
-      const now = Date.now();
-      for(const key of list.keys){
-        if(key === 'player:'+myId) continue;
-        try{
-          const res = await window.storage.get(key, true);
-          if(res && res.value){
-            const data = JSON.parse(res.value);
-            if(now - data.ts > STALE_MS * 3){
-              // leftover from a session that never cleaned up after itself — purge it
-              try{ await window.storage.delete(key, true); }catch(e){}
-              delete players[data.id];
-              continue;
-            }
-            players[data.id] = data;
-          }
-        }catch(e){ /* key may have raced, skip */ }
-      }
-    }catch(e){ /* ignore */ }
+  function pollPlayers(){
+    if(isHost) broadcastSnapshot();
   }
 
   async function applyDamage(targetId, dmg, instakill, weaponName, shooterId){
     const shooterName = shooterId===myId ? myName : (players[shooterId] ? players[shooterId].name : 'Bot');
 
-    // bots and the local player are resolved locally and instantly —
-    // no async round-trip needed (and none of the failure points that come with it)
-    if(targetId.startsWith('bot_') || targetId === myId){
+    // damage to myself is always resolved locally & instantly for responsiveness
+    if(targetId === myId){
       const target = players[targetId];
       if(!target || !target.alive) return;
       if(target.invincibleUntil && Date.now() < target.invincibleUntil) return;
-      if(targetId === myId && godMode) return;
+      if(godMode) return;
       target.hp -= instakill ? 9999 : dmg;
       if(target.hp <= 0){
         target.hp = 0;
         target.alive = false;
         target.deaths = (target.deaths||0)+1;
         target.deathTime = Date.now();
-        if(shooterId===myId){
-          players[myId].kills = (players[myId].kills||0)+1;
-        } else if(shooterId && shooterId.startsWith('bot_') && players[shooterId]){
-          players[shooterId].kills = (players[shooterId].kills||0)+1;
-        }
         addKillFeed(shooterName, target.name, weaponName, instakill);
       }
-      if(targetId === myId) pushMyState();
+      pushMyState();
       return;
     }
 
-    // other real players: update their authoritative shared state
-    try{
-      const res = await window.storage.get('player:'+targetId, true);
-      if(!res || !res.value) return;
-      const target = JSON.parse(res.value);
-      if(!target.alive) return;
-      if(target.invincibleUntil && Date.now() < target.invincibleUntil) return;
-      target.hp -= instakill ? 9999 : dmg;
-      let killed = false;
-      if(target.hp <= 0){
-        target.hp = 0;
-        target.alive = false;
-        target.deaths = (target.deaths||0)+1;
-        target.deathTime = Date.now();
-        killed = true;
+    // bots and other players: the host is the single source of truth
+    if(isHost){
+      applyDamageHostSide(targetId, dmg, instakill, weaponName, shooterId);
+    } else {
+      // optimistic local prediction (host's next snapshot will correct it if wrong)
+      const target = players[targetId];
+      if(target && target.alive && !(target.invincibleUntil && Date.now() < target.invincibleUntil)){
+        target.hp -= instakill ? 9999 : dmg;
+        if(target.hp <= 0){ target.hp = 0; target.alive = false; }
       }
-      target.ts = Date.now();
-      await window.storage.set('player:'+targetId, JSON.stringify(target), true);
-      players[targetId] = target;
-
-      if(killed){
-        if(shooterId===myId){
-          players[myId].kills = (players[myId].kills||0)+1;
-          await pushMyState();
-        } else if(shooterId && shooterId.startsWith('bot_') && players[shooterId]){
-          players[shooterId].kills = (players[shooterId].kills||0)+1;
-        }
-        addKillFeed(shooterName, target.name, weaponName, instakill);
-      }
-    }catch(e){ /* ignore */ }
+      sendToHost({ type:'damage', targetId, dmg, instakill, weaponName, shooterId });
+    }
   }
 
   function addKillFeed(killer, victim, weapon, instakill){
@@ -1102,7 +1208,7 @@
     const now = Date.now();
 
     updateMovement(dt);
-    simulateBots(dt, now);
+    if(isHost) simulateBots(dt, now);
     tryShoot(now);
     updateBullets(dt, now);
     checkRespawn(now);
@@ -1258,11 +1364,46 @@
     });
   }
 
+  function updateConnBadge(){
+    const badge = document.getElementById('connBadge');
+    if(!badge) return;
+    const count = Object.keys(players).filter(id=>!players[id].isBot).length;
+    const role = isHost ? 'anfitrião' : 'conectado';
+    badge.innerHTML = '<span class="dot"></span>Sala <b>'+escapeHtml(roomCode)+'</b> · '+count+' jogador(es) · '+role;
+  }
+
   async function joinGame(){
     const input = document.getElementById('nameInput');
     let name = input.value.trim();
     if(!name) name = 'Jogador' + Math.floor(Math.random()*999);
     myName = name.slice(0,12);
+
+    const roomInputEl = document.getElementById('roomInput');
+    const typedCode = roomInputEl.value.trim().toUpperCase();
+    const statusEl = document.getElementById('connStatus');
+    const joinBtn = document.getElementById('joinBtn');
+
+    joinBtn.disabled = true;
+    statusEl.className = '';
+    statusEl.textContent = typedCode ? 'Conectando à sala '+typedCode+'...' : 'Criando sala...';
+
+    try{
+      if(typedCode){
+        await connectAsClient(typedCode);
+      } else {
+        await connectAsHost(generateRoomCode());
+      }
+    }catch(err){
+      joinBtn.disabled = false;
+      statusEl.className = 'err';
+      statusEl.textContent = typedCode
+        ? 'Não foi possível entrar nessa sala. Confira o código e tente de novo.'
+        : 'Não foi possível criar a sala. Verifique sua conexão e tente de novo.';
+      return;
+    }
+
+    statusEl.className = 'ok';
+    statusEl.textContent = 'Conectado!';
 
     document.getElementById('startScreen').style.display = 'none';
     document.getElementById('gameWrap').style.display = 'block';
@@ -1279,20 +1420,22 @@
     setWeapon('mg');
 
     players[myId] = freshState();
-    for(let i=1;i<=botCount;i++){
-      const b = createBot(i);
-      players[b.id] = b;
+    if(isHost){
+      for(let i=1;i<=botCount;i++){
+        const b = createBot(i);
+        players[b.id] = b;
+      }
     }
-    await pushMyState();
-    await pollPlayers();
+    pushMyState();
 
     running = true;
     requestAnimationFrame(loop);
 
     setInterval(pollPlayers, POLL_INTERVAL);
+    setInterval(updateConnBadge, 1000);
 
     window.addEventListener('beforeunload', ()=>{
-      try{ window.storage.delete('player:'+myId, true); }catch(e){}
+      try{ if(peer) peer.destroy(); }catch(e){}
     });
   }
 
